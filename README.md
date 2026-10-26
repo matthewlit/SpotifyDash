@@ -9,7 +9,8 @@ This dashboard connects directly to your Spotify account using OAuth and shows A
 - Popularity and explicit-content metrics
 - Top genres inferred from your top artists
 - Recent listening activity patterns (hour-of-day)
-- Recommendation suggestions based on your top tracks
+- Discovery suggestions based on your top tracks when Spotify's Recommendations API is available
+- Top artists and songs by day, week, month, and year from Spotify extended streaming history
 - CSV export for top tracks, top artists, and recent plays
 
 ## Project structure
@@ -59,3 +60,13 @@ python -m streamlit run app.py
 - Spotify Web API does **not** provide full lifetime play-by-play history.
 - `Top` endpoints are Spotify-computed windows (`short_term`, `medium_term`, `long_term`).
 - `Recently Played` is limited to recent listens (not your full history).
+
+## Rankings from extended streaming history
+
+1. Request your **Extended streaming history** from Spotify's privacy/data download page.
+2. In the dashboard, upload all `Streaming_History_Audio_*.json` files from the export.
+3. Open the Day, Week, Month, or Year tab and choose a period to see its top artists and songs.
+
+Play counts are based on recorded history entries; listening time is shown separately. Weeks start
+on Monday and timestamps are grouped in UTC. The uploaded files are analyzed in the current app
+session and are not saved by the dashboard.

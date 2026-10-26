@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from importlib import import_module
 from importlib.util import find_spec
@@ -11,10 +12,19 @@ import streamlit as st
 
 if find_spec("spotipy") is not None:
     spotipy = import_module("spotipy")
+    SPOTIFY_API_EXCEPTIONS = (import_module("spotipy.exceptions").SpotifyException,)
 else:
     spotipy = None
+    SPOTIFY_API_EXCEPTIONS = ()
 
 st.set_page_config(page_title="Spotify Account Dashboard", page_icon="🎧", layout="wide")
+
+HISTORY_FIELDS = {
+    "played_at": ("ts", "endTime", "end_time"),
+    "artist_name": ("master_metadata_album_artist_name", "artistName", "artist_name"),
+    "track_name": ("master_metadata_track_name", "trackName", "track_name"),
+    "ms_played": ("ms_played", "msPlayed", "millisecondsPlayed"),
+}
 
 
 def apply_spotify_theme() -> None:
@@ -47,6 +57,114 @@ def apply_spotify_theme() -> None:
         """,
         unsafe_allow_html=True,
     )
+
+
+def parse_streaming_history_files(
+    files: list[tuple[str, bytes]],
+) -> tuple[pd.DataFrame, list[str]]:
+    rows: list[dict[str, object]] = []
+    errors: list[str] = []
+
+    for filename, content in files:
+        try:
+            records = json.loads(content)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            errors.append(f"{filename}: could not read JSON ({exc})")
+            continue
+
+        if not isinstance(records, list):
+            errors.append(f"{filename}: expected a JSON array of streaming-history records")
+            continue
+
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+
+            values = {
+                name: next((record.get(key) for key in keys if record.get(key) is not None), None)
+                for name, keys in HISTORY_FIELDS.items()
+            }
+            played_at = pd.to_datetime(values["played_at"], utc=True, errors="coerce")
+            artist_name = str(values["artist_name"] or "").strip()
+            track_name = str(values["track_name"] or "").strip()
+            if pd.isna(played_at) or not artist_name or not track_name:
+                continue
+
+            ms_played = pd.to_numeric(values["ms_played"], errors="coerce")
+            rows.append(
+                {
+                    "played_at": played_at,
+                    "artist_name": artist_name,
+                    "track_name": track_name,
+                    "minutes_played": float(ms_played) / 60000 if pd.notna(ms_played) else 0.0,
+                }
+            )
+
+    history = pd.DataFrame(rows)
+    if history.empty:
+        return history, errors
+
+    date_utc = history["played_at"].dt.tz_localize(None)
+    history["day"] = date_utc.dt.strftime("%Y-%m-%d")
+    history["week"] = date_utc.dt.to_period("W-SUN").dt.start_time.dt.strftime("%Y-%m-%d")
+    history["month"] = date_utc.dt.strftime("%Y-%m")
+    history["year"] = date_utc.dt.strftime("%Y")
+    return history, errors
+
+
+def render_history_rankings(history: pd.DataFrame) -> None:
+    st.subheader("Top artists and songs by listening period")
+    st.caption(
+        "Ranked by recorded play count from your uploaded Spotify streaming history. "
+        "Week periods start on Monday; timestamps are grouped in UTC."
+    )
+
+    tabs = st.tabs(["Day", "Week", "Month", "Year"])
+    for tab, period in zip(tabs, ("day", "week", "month", "year")):
+        with tab:
+            period_values = sorted(history[period].dropna().unique(), reverse=True)
+            if period == "week":
+                period_labels = {value: f"Week of {value}" for value in period_values}
+            else:
+                period_labels = {value: value for value in period_values}
+
+            selected_period = st.selectbox(
+                f"Select {period}",
+                period_values,
+                format_func=lambda value, labels=period_labels: labels[value],
+                key=f"history_{period}_selection",
+            )
+            selected = history.loc[history[period] == selected_period]
+            artists = (
+                selected.groupby("artist_name", as_index=False)
+                .agg(plays=("track_name", "size"), minutes_played=("minutes_played", "sum"))
+                .sort_values(["plays", "minutes_played", "artist_name"], ascending=[False, False, True])
+                .head(10)
+                .reset_index(drop=True)
+            )
+            songs = (
+                selected.groupby(["track_name", "artist_name"], as_index=False)
+                .agg(plays=("track_name", "size"), minutes_played=("minutes_played", "sum"))
+                .sort_values(
+                    ["plays", "minutes_played", "track_name", "artist_name"],
+                    ascending=[False, False, True, True],
+                )
+                .head(10)
+                .reset_index(drop=True)
+            )
+            artists.insert(0, "rank", range(1, len(artists) + 1))
+            songs.insert(0, "rank", range(1, len(songs) + 1))
+            artists["minutes_played"] = artists["minutes_played"].round(1)
+            songs["minutes_played"] = songs["minutes_played"].round(1)
+
+            st.caption(f"{len(selected):,} plays in this period")
+            artist_column, song_column = st.columns(2)
+            with artist_column:
+                st.markdown("**Top artists**")
+                st.dataframe(artists, hide_index=True)
+            with song_column:
+                st.markdown("**Top songs**")
+                st.dataframe(songs, hide_index=True)
 
 
 @st.cache_data(show_spinner=True)
@@ -141,12 +259,23 @@ def fetch_recent_plays(access_token: str, limit: int = 50) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
-def fetch_recommendations(access_token: str, seed_track_ids: tuple[str, ...]) -> pd.DataFrame:
+def fetch_recommendations(
+    access_token: str, seed_track_ids: tuple[str, ...]
+) -> tuple[pd.DataFrame, str | None]:
     if spotipy is None or not seed_track_ids:
-        return pd.DataFrame()
+        return pd.DataFrame(), None
 
     client = spotipy.Spotify(auth=access_token, requests_timeout=15, retries=3)
-    response = client.recommendations(seed_tracks=list(seed_track_ids)[:5], limit=20)
+    try:
+        response = client.recommendations(seed_tracks=list(seed_track_ids)[:5], limit=20)
+    except SPOTIFY_API_EXCEPTIONS as exc:
+        if getattr(exc, "http_status", None) == 404:
+            return (
+                pd.DataFrame(),
+                "Spotify's Recommendations API returned HTTP 404. Discovery suggestions are unavailable; other dashboard data is unaffected.",
+            )
+        raise
+
     items = response.get("tracks", [])
 
     rows: list[dict[str, object]] = []
@@ -161,7 +290,7 @@ def fetch_recommendations(access_token: str, seed_track_ids: tuple[str, ...]) ->
                 "external_url": (track.get("external_urls") or {}).get("spotify", ""),
             }
         )
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows), None
 
 
 def _get_spotify_oauth(client_id: str, client_secret: str, redirect_uri: str):
@@ -225,7 +354,32 @@ def to_csv_bytes(df: pd.DataFrame) -> bytes:
 def main() -> None:
     apply_spotify_theme()
     st.title("Spotify Account Analytics Dashboard")
-    st.caption("API-powered analytics from your Spotify account (no extended history files required)")
+    st.caption("Spotify account analytics plus rankings from your streaming-history export")
+
+    st.subheader("Listening history rankings")
+    st.caption(
+        "Upload the Streaming_History_Audio JSON files from your Spotify data download to see "
+        "top artists and songs by day, week, month, and year."
+    )
+    history_files = st.file_uploader(
+        "Spotify extended streaming history JSON files",
+        type=["json"],
+        accept_multiple_files=True,
+        help="Select all Streaming_History_Audio JSON files in your Spotify data export.",
+    )
+    history, history_errors = parse_streaming_history_files(
+        [(file.name, file.getvalue()) for file in history_files]
+    )
+    for error in history_errors:
+        st.warning(error)
+    if not history.empty:
+        render_history_rankings(history)
+    elif history_files and not history_errors:
+        st.info("No valid song plays were found in the uploaded files.")
+    else:
+        st.info("Upload your Spotify extended streaming history to see period rankings.")
+
+    st.markdown("---")
 
     if spotipy is None:
         st.error("Spotipy is not installed. Run: python -m pip install -r requirements.txt")
@@ -415,8 +569,10 @@ def main() -> None:
 
     st.subheader("Discovery Suggestions")
     seed_ids = tuple(top_tracks["track_id"].dropna().astype(str).head(5).tolist()) if not top_tracks.empty else tuple()
-    suggestions = fetch_recommendations(access_token, seed_ids)
-    if not suggestions.empty:
+    suggestions, recommendation_error = fetch_recommendations(access_token, seed_ids)
+    if recommendation_error:
+        st.info(recommendation_error)
+    elif not suggestions.empty:
         st.caption("Generated from your top tracks using Spotify recommendations.")
         st.dataframe(suggestions, use_container_width=True, hide_index=True)
     else:
